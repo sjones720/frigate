@@ -1,7 +1,6 @@
-"""Maintain embeddings in Chroma."""
+"""Maintain embeddings in SQLite-vec."""
 
 import base64
-import io
 import logging
 import os
 import threading
@@ -11,8 +10,9 @@ from typing import Optional
 import cv2
 import numpy as np
 from peewee import DoesNotExist
-from PIL import Image
+from playhouse.sqliteq import SqliteQueueDatabase
 
+from frigate.comms.embeddings_updater import EmbeddingsRequestEnum, EmbeddingsResponder
 from frigate.comms.event_metadata_updater import (
     EventMetadataSubscriber,
     EventMetadataTypeEnum,
@@ -24,9 +24,10 @@ from frigate.const import CLIPS_DIR, UPDATE_EVENT_DESCRIPTION
 from frigate.events.types import EventTypeEnum
 from frigate.genai import get_genai_client
 from frigate.models import Event
+from frigate.util.builtin import serialize
 from frigate.util.image import SharedMemoryFrameManager, calculate_region
 
-from .embeddings import Embeddings, get_metadata
+from .embeddings import Embeddings
 
 logger = logging.getLogger(__name__)
 
@@ -36,18 +37,24 @@ class EmbeddingMaintainer(threading.Thread):
 
     def __init__(
         self,
+        db: SqliteQueueDatabase,
         config: FrigateConfig,
         stop_event: MpEvent,
     ) -> None:
-        threading.Thread.__init__(self)
-        self.name = "embeddings_maintainer"
+        super().__init__(name="embeddings_maintainer")
         self.config = config
-        self.embeddings = Embeddings()
+        self.embeddings = Embeddings(config.semantic_search, db)
+
+        # Check if we need to re-index events
+        if config.semantic_search.reindex:
+            self.embeddings.reindex()
+
         self.event_subscriber = EventUpdateSubscriber()
         self.event_end_subscriber = EventEndSubscriber()
         self.event_metadata_subscriber = EventMetadataSubscriber(
             EventMetadataTypeEnum.regenerate_description
         )
+        self.embeddings_responder = EmbeddingsResponder()
         self.frame_manager = SharedMemoryFrameManager()
         # create communication for updating event descriptions
         self.requestor = InterProcessRequestor()
@@ -56,8 +63,9 @@ class EmbeddingMaintainer(threading.Thread):
         self.genai_client = get_genai_client(config.genai)
 
     def run(self) -> None:
-        """Maintain a Chroma vector database for semantic search."""
+        """Maintain a SQLite-vec database for semantic search."""
         while not self.stop_event.is_set():
+            self._process_requests()
             self._process_updates()
             self._process_finalized()
             self._process_event_metadata()
@@ -65,12 +73,40 @@ class EmbeddingMaintainer(threading.Thread):
         self.event_subscriber.stop()
         self.event_end_subscriber.stop()
         self.event_metadata_subscriber.stop()
+        self.embeddings_responder.stop()
         self.requestor.stop()
         logger.info("Exiting embeddings maintenance...")
 
+    def _process_requests(self) -> None:
+        """Process embeddings requests"""
+
+        def _handle_request(topic: str, data: str) -> str:
+            try:
+                if topic == EmbeddingsRequestEnum.embed_description.value:
+                    return serialize(
+                        self.embeddings.upsert_description(
+                            data["id"], data["description"]
+                        ),
+                        pack=False,
+                    )
+                elif topic == EmbeddingsRequestEnum.embed_thumbnail.value:
+                    thumbnail = base64.b64decode(data["thumbnail"])
+                    return serialize(
+                        self.embeddings.upsert_thumbnail(data["id"], thumbnail),
+                        pack=False,
+                    )
+                elif topic == EmbeddingsRequestEnum.generate_search.value:
+                    return serialize(
+                        self.embeddings.text_embedding([data])[0], pack=False
+                    )
+            except Exception as e:
+                logger.error(f"Unable to handle embeddings request {e}")
+
+        self.embeddings_responder.check_for_request(_handle_request)
+
     def _process_updates(self) -> None:
         """Process event updates"""
-        update = self.event_subscriber.check_for_update()
+        update = self.event_subscriber.check_for_update(timeout=0.1)
 
         if update is None:
             return
@@ -99,7 +135,7 @@ class EmbeddingMaintainer(threading.Thread):
     def _process_finalized(self) -> None:
         """Process the end of an event."""
         while True:
-            ended = self.event_end_subscriber.check_for_update()
+            ended = self.event_end_subscriber.check_for_update(timeout=0.1)
 
             if ended == None:
                 break
@@ -117,12 +153,11 @@ class EmbeddingMaintainer(threading.Thread):
                 if event.data.get("type") != "object":
                     continue
 
-                # Extract valid event metadata
-                metadata = get_metadata(event)
+                # Extract valid thumbnail
                 thumbnail = base64.b64decode(event.thumbnail)
 
                 # Embed the thumbnail
-                self._embed_thumbnail(event_id, thumbnail, metadata)
+                self._embed_thumbnail(event_id, thumbnail)
 
                 if (
                     camera_config.genai.enabled
@@ -137,9 +172,6 @@ class EmbeddingMaintainer(threading.Thread):
                         or set(event.zones) & set(camera_config.genai.required_zones)
                     )
                 ):
-                    logger.debug(
-                        f"Description generation for {event}, has_snapshot: {event.has_snapshot}"
-                    )
                     if event.has_snapshot and camera_config.genai.use_snapshot:
                         with open(
                             os.path.join(CLIPS_DIR, f"{event.camera}-{event.id}.jpg"),
@@ -183,7 +215,6 @@ class EmbeddingMaintainer(threading.Thread):
                         args=(
                             event,
                             embed_image,
-                            metadata,
                         ),
                     ).start()
 
@@ -194,7 +225,7 @@ class EmbeddingMaintainer(threading.Thread):
     def _process_event_metadata(self):
         # Check for regenerate description requests
         (topic, event_id, source) = self.event_metadata_subscriber.check_for_update(
-            timeout=1
+            timeout=0.1
         )
 
         if topic is None:
@@ -219,25 +250,16 @@ class EmbeddingMaintainer(threading.Thread):
 
         return None
 
-    def _embed_thumbnail(self, event_id: str, thumbnail: bytes, metadata: dict) -> None:
+    def _embed_thumbnail(self, event_id: str, thumbnail: bytes) -> None:
         """Embed the thumbnail for an event."""
+        self.embeddings.upsert_thumbnail(event_id, thumbnail)
 
-        # Encode the thumbnail
-        img = np.array(Image.open(io.BytesIO(thumbnail)).convert("RGB"))
-        self.embeddings.thumbnail.upsert(
-            images=[img],
-            metadatas=[metadata],
-            ids=[event_id],
-        )
-
-    def _embed_description(
-        self, event: Event, thumbnails: list[bytes], metadata: dict
-    ) -> None:
+    def _embed_description(self, event: Event, thumbnails: list[bytes]) -> None:
         """Embed the description for an event."""
         camera_config = self.config.cameras[event.camera]
 
         description = self.genai_client.generate_description(
-            camera_config, thumbnails, metadata
+            camera_config, thumbnails, event
         )
 
         if not description:
@@ -251,11 +273,7 @@ class EmbeddingMaintainer(threading.Thread):
         )
 
         # Encode the description
-        self.embeddings.description.upsert(
-            documents=[description],
-            metadatas=[metadata],
-            ids=[event.id],
-        )
+        self.embeddings.upsert_description(event.id, description)
 
         logger.debug(
             "Generated description for %s (%d images): %s",
@@ -276,7 +294,6 @@ class EmbeddingMaintainer(threading.Thread):
             logger.error(f"GenAI not enabled for camera {event.camera}")
             return
 
-        metadata = get_metadata(event)
         thumbnail = base64.b64decode(event.thumbnail)
 
         logger.debug(
@@ -315,4 +332,4 @@ class EmbeddingMaintainer(threading.Thread):
             )
         )
 
-        self._embed_description(event, embed_image, metadata)
+        self._embed_description(event, embed_image)

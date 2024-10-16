@@ -25,7 +25,7 @@ Available via HACS as a default repository. To install:
 - Use [HACS](https://hacs.xyz/) to install the integration:
 
 ```
-Home Assistant > HACS > Integrations > "Explore & Add Integrations" > Frigate
+Home Assistant > HACS > Click in the Search bar and type "Frigate" > Frigate
 ```
 
 - Restart Home Assistant.
@@ -215,7 +215,7 @@ For advanced usecases, this behavior can be changed with the [RTSP URL
 template](#options) option. When set, this string will override the default stream
 address that is derived from the default behavior described above. This option supports
 [jinja2 templates](https://jinja.palletsprojects.com/) and has the `camera` dict
-variables from [Frigate API](api.md)
+variables from [Frigate API](../integrations/api)
 available for the template. Note that no Home Assistant state is available to the
 template, only the camera dict from Frigate.
 

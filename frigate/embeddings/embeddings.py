@@ -1,37 +1,28 @@
-"""ChromaDB embeddings database."""
+"""SQLite-vec embeddings database."""
 
 import base64
 import io
 import logging
-import sys
+import os
 import time
 
-import numpy as np
+from numpy import ndarray
 from PIL import Image
 from playhouse.shortcuts import model_to_dict
 
+from frigate.comms.inter_process import InterProcessRequestor
+from frigate.config.semantic_search import SemanticSearchConfig
+from frigate.const import (
+    CONFIG_DIR,
+    UPDATE_EMBEDDINGS_REINDEX_PROGRESS,
+    UPDATE_MODEL_STATE,
+)
+from frigate.db.sqlitevecq import SqliteVecQueueDatabase
 from frigate.models import Event
+from frigate.types import ModelStatusTypesEnum
+from frigate.util.builtin import serialize
 
-# Squelch posthog logging
-logging.getLogger("chromadb.telemetry.product.posthog").setLevel(logging.CRITICAL)
-
-# Hot-swap the sqlite3 module for Chroma compatibility
-try:
-    from chromadb import Collection
-    from chromadb import HttpClient as ChromaClient
-    from chromadb.config import Settings
-
-    from .functions.clip import ClipEmbedding
-    from .functions.minilm_l6_v2 import MiniLMEmbedding
-except RuntimeError:
-    __import__("pysqlite3")
-    sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
-    from chromadb import Collection
-    from chromadb import HttpClient as ChromaClient
-    from chromadb.config import Settings
-
-    from .functions.clip import ClipEmbedding
-    from .functions.minilm_l6_v2 import MiniLMEmbedding
+from .functions.onnx import GenericONNXEmbedding
 
 logger = logging.getLogger(__name__)
 
@@ -68,42 +59,183 @@ def get_metadata(event: Event) -> dict:
 
 
 class Embeddings:
-    """ChromaDB embeddings database."""
+    """SQLite-vec embeddings database."""
 
-    def __init__(self) -> None:
-        self.client: ChromaClient = ChromaClient(
-            host="127.0.0.1",
-            settings=Settings(anonymized_telemetry=False),
+    def __init__(
+        self, config: SemanticSearchConfig, db: SqliteVecQueueDatabase
+    ) -> None:
+        self.config = config
+        self.db = db
+        self.requestor = InterProcessRequestor()
+
+        # Create tables if they don't exist
+        self.db.create_embeddings_tables()
+
+        models = [
+            "jinaai/jina-clip-v1-text_model_fp16.onnx",
+            "jinaai/jina-clip-v1-tokenizer",
+            "jinaai/jina-clip-v1-vision_model_fp16.onnx"
+            if config.model_size == "large"
+            else "jinaai/jina-clip-v1-vision_model_quantized.onnx",
+            "jinaai/jina-clip-v1-preprocessor_config.json",
+        ]
+
+        for model in models:
+            self.requestor.send_data(
+                UPDATE_MODEL_STATE,
+                {
+                    "model": model,
+                    "state": ModelStatusTypesEnum.not_downloaded,
+                },
+            )
+
+        self.text_embedding = GenericONNXEmbedding(
+            model_name="jinaai/jina-clip-v1",
+            model_file="text_model_fp16.onnx",
+            tokenizer_file="tokenizer",
+            download_urls={
+                "text_model_fp16.onnx": "https://huggingface.co/jinaai/jina-clip-v1/resolve/main/onnx/text_model_fp16.onnx",
+            },
+            model_size=config.model_size,
+            model_type="text",
+            requestor=self.requestor,
+            device="CPU",
         )
 
-    @property
-    def thumbnail(self) -> Collection:
-        return self.client.get_or_create_collection(
-            name="event_thumbnail", embedding_function=ClipEmbedding()
+        model_file = (
+            "vision_model_fp16.onnx"
+            if self.config.model_size == "large"
+            else "vision_model_quantized.onnx"
         )
 
-    @property
-    def description(self) -> Collection:
-        return self.client.get_or_create_collection(
-            name="event_description",
-            embedding_function=MiniLMEmbedding(
-                preferred_providers=["CPUExecutionProvider"]
-            ),
-        )
-
-    def reindex(self) -> None:
-        """Reindex all event embeddings."""
-        logger.info("Indexing event embeddings...")
-        self.client.reset()
-
-        st = time.time()
-        totals = {
-            "thumb": 0,
-            "desc": 0,
+        download_urls = {
+            model_file: f"https://huggingface.co/jinaai/jina-clip-v1/resolve/main/onnx/{model_file}",
+            "preprocessor_config.json": "https://huggingface.co/jinaai/jina-clip-v1/resolve/main/preprocessor_config.json",
         }
 
-        batch_size = 100
+        self.vision_embedding = GenericONNXEmbedding(
+            model_name="jinaai/jina-clip-v1",
+            model_file=model_file,
+            download_urls=download_urls,
+            model_size=config.model_size,
+            model_type="vision",
+            requestor=self.requestor,
+            device="GPU" if config.model_size == "large" else "CPU",
+        )
+
+    def upsert_thumbnail(self, event_id: str, thumbnail: bytes) -> ndarray:
+        # Convert thumbnail bytes to PIL Image
+        image = Image.open(io.BytesIO(thumbnail)).convert("RGB")
+        embedding = self.vision_embedding([image])[0]
+
+        self.db.execute_sql(
+            """
+            INSERT OR REPLACE INTO vec_thumbnails(id, thumbnail_embedding)
+            VALUES(?, ?)
+            """,
+            (event_id, serialize(embedding)),
+        )
+
+        return embedding
+
+    def batch_upsert_thumbnail(self, event_thumbs: dict[str, bytes]) -> list[ndarray]:
+        images = [
+            Image.open(io.BytesIO(thumb)).convert("RGB")
+            for thumb in event_thumbs.values()
+        ]
+        ids = list(event_thumbs.keys())
+        embeddings = self.vision_embedding(images)
+
+        items = []
+
+        for i in range(len(ids)):
+            items.append(ids[i])
+            items.append(serialize(embeddings[i]))
+
+        self.db.execute_sql(
+            """
+            INSERT OR REPLACE INTO vec_thumbnails(id, thumbnail_embedding)
+            VALUES {}
+            """.format(", ".join(["(?, ?)"] * len(ids))),
+            items,
+        )
+        return embeddings
+
+    def upsert_description(self, event_id: str, description: str) -> ndarray:
+        embedding = self.text_embedding([description])[0]
+        self.db.execute_sql(
+            """
+            INSERT OR REPLACE INTO vec_descriptions(id, description_embedding)
+            VALUES(?, ?)
+            """,
+            (event_id, serialize(embedding)),
+        )
+
+        return embedding
+
+    def batch_upsert_description(self, event_descriptions: dict[str, str]) -> ndarray:
+        # upsert embeddings one by one to avoid token limit
+        embeddings = []
+
+        for desc in event_descriptions.values():
+            embeddings.append(self.text_embedding([desc])[0])
+
+        ids = list(event_descriptions.keys())
+
+        items = []
+
+        for i in range(len(ids)):
+            items.append(ids[i])
+            items.append(serialize(embeddings[i]))
+
+        self.db.execute_sql(
+            """
+            INSERT OR REPLACE INTO vec_descriptions(id, description_embedding)
+            VALUES {}
+            """.format(", ".join(["(?, ?)"] * len(ids))),
+            items,
+        )
+
+        return embeddings
+
+    def reindex(self) -> None:
+        logger.info("Indexing tracked object embeddings...")
+
+        self.db.drop_embeddings_tables()
+        logger.debug("Dropped embeddings tables.")
+        self.db.create_embeddings_tables()
+        logger.debug("Created embeddings tables.")
+
+        # Delete the saved stats file
+        if os.path.exists(os.path.join(CONFIG_DIR, ".search_stats.json")):
+            os.remove(os.path.join(CONFIG_DIR, ".search_stats.json"))
+
+        st = time.time()
+
+        # Get total count of events to process
+        total_events = (
+            Event.select()
+            .where(
+                (Event.has_clip == True | Event.has_snapshot == True)
+                & Event.thumbnail.is_null(False)
+            )
+            .count()
+        )
+
+        batch_size = 32
         current_page = 1
+
+        totals = {
+            "thumbnails": 0,
+            "descriptions": 0,
+            "processed_objects": total_events - 1 if total_events < batch_size else 0,
+            "total_objects": total_events,
+            "time_remaining": 0 if total_events < batch_size else -1,
+            "status": "indexing",
+        }
+
+        self.requestor.send_data(UPDATE_EMBEDDINGS_REINDEX_PROGRESS, totals)
+
         events = (
             Event.select()
             .where(
@@ -115,38 +247,46 @@ class Embeddings:
         )
 
         while len(events) > 0:
-            thumbnails = {"ids": [], "images": [], "metadatas": []}
-            descriptions = {"ids": [], "documents": [], "metadatas": []}
-
             event: Event
+            batch_thumbs = {}
+            batch_descs = {}
             for event in events:
-                metadata = get_metadata(event)
-                thumbnail = base64.b64decode(event.thumbnail)
-                img = np.array(Image.open(io.BytesIO(thumbnail)).convert("RGB"))
-                thumbnails["ids"].append(event.id)
-                thumbnails["images"].append(img)
-                thumbnails["metadatas"].append(metadata)
+                batch_thumbs[event.id] = base64.b64decode(event.thumbnail)
+                totals["thumbnails"] += 1
+
                 if description := event.data.get("description", "").strip():
-                    descriptions["ids"].append(event.id)
-                    descriptions["documents"].append(description)
-                    descriptions["metadatas"].append(metadata)
+                    batch_descs[event.id] = description
+                    totals["descriptions"] += 1
 
-            if len(thumbnails["ids"]) > 0:
-                totals["thumb"] += len(thumbnails["ids"])
-                self.thumbnail.upsert(
-                    images=thumbnails["images"],
-                    metadatas=thumbnails["metadatas"],
-                    ids=thumbnails["ids"],
-                )
+                totals["processed_objects"] += 1
 
-            if len(descriptions["ids"]) > 0:
-                totals["desc"] += len(descriptions["ids"])
-                self.description.upsert(
-                    documents=descriptions["documents"],
-                    metadatas=descriptions["metadatas"],
-                    ids=descriptions["ids"],
-                )
+            # run batch embedding
+            self.batch_upsert_thumbnail(batch_thumbs)
 
+            if batch_descs:
+                self.batch_upsert_description(batch_descs)
+
+            # report progress every batch so we don't spam the logs
+            progress = (totals["processed_objects"] / total_events) * 100
+            logger.debug(
+                "Processed %d/%d events (%.2f%% complete) | Thumbnails: %d, Descriptions: %d",
+                totals["processed_objects"],
+                total_events,
+                progress,
+                totals["thumbnails"],
+                totals["descriptions"],
+            )
+
+            # Calculate time remaining
+            elapsed_time = time.time() - st
+            avg_time_per_event = elapsed_time / totals["processed_objects"]
+            remaining_events = total_events - totals["processed_objects"]
+            time_remaining = avg_time_per_event * remaining_events
+            totals["time_remaining"] = int(time_remaining)
+
+            self.requestor.send_data(UPDATE_EMBEDDINGS_REINDEX_PROGRESS, totals)
+
+            # Move to the next page
             current_page += 1
             events = (
                 Event.select()
@@ -160,7 +300,10 @@ class Embeddings:
 
         logger.info(
             "Embedded %d thumbnails and %d descriptions in %s seconds",
-            totals["thumb"],
-            totals["desc"],
-            time.time() - st,
+            totals["thumbnails"],
+            totals["descriptions"],
+            round(time.time() - st, 1),
         )
+        totals["status"] = "completed"
+
+        self.requestor.send_data(UPDATE_EMBEDDINGS_REINDEX_PROGRESS, totals)

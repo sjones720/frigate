@@ -19,13 +19,7 @@ export interface BirdseyeConfig {
   width: number;
 }
 
-export const ATTRIBUTE_LABELS = [
-  "amazon",
-  "face",
-  "fedex",
-  "license_plate",
-  "ups",
-];
+export type SearchModelSize = "small" | "large";
 
 export interface CameraConfig {
   audio: {
@@ -340,6 +334,7 @@ export interface FrigateConfig {
     path: string | null;
     width: number;
     colormap: { [key: string]: [number, number, number] };
+    attributes_map: { [key: string]: [string] };
   };
 
   motion: Record<string, unknown> | null;
@@ -417,6 +412,8 @@ export interface FrigateConfig {
 
   semantic_search: {
     enabled: boolean;
+    reindex: boolean;
+    model_size: SearchModelSize;
   };
 
   snapshots: {

@@ -4,12 +4,15 @@ import math
 
 
 class ZScoreNormalization:
-    """Running Z-score normalization for search distance."""
-
-    def __init__(self):
+    def __init__(self, scale_factor: float = 1.0, bias: float = 0.0):
+        """Initialize with optional scaling and bias adjustments."""
+        """scale_factor adjusts the magnitude of each score"""
+        """bias will artificially shift the entire distribution upwards"""
         self.n = 0
         self.mean = 0
         self.m2 = 0
+        self.scale_factor = scale_factor
+        self.bias = bias
 
     @property
     def variance(self):
@@ -17,13 +20,17 @@ class ZScoreNormalization:
 
     @property
     def stddev(self):
-        return math.sqrt(self.variance)
+        return math.sqrt(self.variance) if self.variance > 0 else 0.0
 
-    def normalize(self, distances: list[float]):
-        self._update(distances)
+    def normalize(self, distances: list[float], save_stats: bool):
+        if save_stats:
+            self._update(distances)
         if self.stddev == 0:
             return distances
-        return [(x - self.mean) / self.stddev for x in distances]
+        return [
+            (x - self.mean) / self.stddev * self.scale_factor + self.bias
+            for x in distances
+        ]
 
     def _update(self, distances: list[float]):
         for x in distances:

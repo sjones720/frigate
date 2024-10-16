@@ -2,11 +2,11 @@ import React, { useState, useRef, useEffect, useCallback } from "react";
 import {
   LuX,
   LuFilter,
-  LuImage,
   LuChevronDown,
   LuChevronUp,
   LuTrash2,
   LuStar,
+  LuSearch,
 } from "react-icons/lu";
 import {
   FilterType,
@@ -43,6 +43,7 @@ import {
 import { toast } from "sonner";
 import useSWR from "swr";
 import { FrigateConfig } from "@/types/frigateConfig";
+import { MdImageSearch } from "react-icons/md";
 
 type InputWithTagsProps = {
   inputFocused: boolean;
@@ -161,8 +162,12 @@ export default function InputWithTags({
         .map((word) => word.trim())
         .lastIndexOf(words.filter((word) => word.trim() !== "").pop() || "");
       const currentWord = words[lastNonEmptyWordIndex];
+      if (words.at(-1) === "") {
+        return current_suggestions;
+      }
+
       return current_suggestions.filter((suggestion) =>
-        suggestion.toLowerCase().includes(currentWord.toLowerCase()),
+        suggestion.toLowerCase().startsWith(currentWord),
       );
     },
     [inputValue, suggestions, currentFilterType],
@@ -397,6 +402,11 @@ export default function InputWithTags({
     setIsSimilaritySearch(false);
   }, [setFilters, resetSuggestions, setSearch, setInputFocused]);
 
+  const handleClearSimilarity = useCallback(() => {
+    removeFilter("event_id", filters.event_id!);
+    removeFilter("search_type", "similarity");
+  }, [removeFilter, filters]);
+
   const handleInputBlur = useCallback(
     (e: React.FocusEvent) => {
       if (
@@ -504,7 +514,7 @@ export default function InputWithTags({
             onFocus={handleInputFocus}
             onBlur={handleInputBlur}
             onKeyDown={handleInputKeyDown}
-            className="text-md h-9 pr-24"
+            className="text-md h-9 pr-32"
             placeholder="Search..."
           />
           <div className="absolute right-3 top-0 flex h-full flex-row items-center justify-center gap-5">
@@ -539,7 +549,7 @@ export default function InputWithTags({
             {isSimilaritySearch && (
               <Tooltip>
                 <TooltipTrigger className="cursor-default">
-                  <LuImage
+                  <MdImageSearch
                     aria-label="Similarity search active"
                     className="size-4 text-selected"
                   />
@@ -631,14 +641,26 @@ export default function InputWithTags({
             inputFocused ? "visible" : "hidden",
           )}
         >
-          {(Object.keys(filters).length > 0 || isSimilaritySearch) && (
+          {!currentFilterType && inputValue && (
+            <CommandGroup heading="Search">
+              <CommandItem
+                className="cursor-pointer"
+                onSelect={() => handleSearch(inputValue)}
+              >
+                <LuSearch className="mr-2 h-4 w-4" />
+                Search for "{inputValue}"
+              </CommandItem>
+            </CommandGroup>
+          )}
+          {(Object.keys(filters).filter((key) => key !== "query").length > 0 ||
+            isSimilaritySearch) && (
             <CommandGroup heading="Active Filters">
               <div className="my-2 flex flex-wrap gap-2 px-2">
                 {isSimilaritySearch && (
                   <span className="inline-flex items-center whitespace-nowrap rounded-full bg-blue-100 px-2 py-0.5 text-sm text-blue-800">
                     Similarity Search
                     <button
-                      onClick={handleClearInput}
+                      onClick={handleClearSimilarity}
                       className="ml-1 focus:outline-none"
                       aria-label="Clear similarity search"
                     >

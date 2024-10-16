@@ -334,6 +334,9 @@ review:
       - car
       - person
     # Optional: required zones for an object to be marked as an alert (default: none)
+    # NOTE: when settings required zones globally, this zone must exist on all cameras
+    #       or the config will be considered invalid. In that case the required_zones
+    #       should be configured at the camera level.
     required_zones:
       - driveway
   # Optional: detections configuration
@@ -343,12 +346,20 @@ review:
       - car
       - person
     # Optional: required zones for an object to be marked as a detection (default: none)
+    # NOTE: when settings required zones globally, this zone must exist on all cameras
+    #       or the config will be considered invalid. In that case the required_zones
+    #       should be configured at the camera level.
     required_zones:
       - driveway
 
 # Optional: Motion configuration
 # NOTE: Can be overridden at the camera level
 motion:
+  # Optional: enables detection for the camera (default: True)
+  # NOTE: Motion detection is required for object detection,
+  #       setting this to False and leaving detect enabled
+  #       will result in an error on startup.
+  enabled: False
   # Optional: The threshold passed to cv2.threshold to determine if a pixel is different enough to be counted as motion. (default: shown below)
   # Increasing this value will make motion detection less sensitive and decreasing it will make motion detection more sensitive.
   # The value should be between 1 and 255.
@@ -507,6 +518,9 @@ semantic_search:
   enabled: False
   # Optional: Re-index embeddings database from historical tracked objects (default: shown below)
   reindex: False
+  # Optional: Set the model size used for embeddings. (default: shown below)
+  # NOTE: small model runs on CPU and large model runs on GPU
+  model_size: "small"
 
 # Optional: Configuration for AI generated tracked object descriptions
 # NOTE: Semantic Search must be enabled for this to do anything.
@@ -804,7 +818,7 @@ camera_groups:
       - side_cam
       - front_doorbell_cam
     # Required: icon used for group
-    icon: car
+    icon: LuCar
     # Required: index of this group
     order: 0
 ```
